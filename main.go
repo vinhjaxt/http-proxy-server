@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"crypto/tls"
 	"encoding/base64"
 	"flag"
 	"io"
@@ -17,10 +18,11 @@ import (
 var httpClientTimeout = 15 * time.Second
 var dialTimeout = 7 * time.Second
 
-var localDialFunc = (&net.Dialer{
+var netDialer = &net.Dialer{
 	Timeout:   dialTimeout,
 	DualStack: true,
-}).Dial
+}
+var localDialFunc = netDialer.Dial
 
 var httpClientLocal = &fasthttp.Client{
 	ReadTimeout:         30 * time.Second,
@@ -123,7 +125,12 @@ var listen = flag.String(`l`, `:8081`, `Listen address. Eg: :8443; unix:/tmp/pro
 var certFile = flag.String(`cert`, ``, `Certificate file (for tls). Eg: cert.pem`)
 var keyFile = flag.String(`key`, ``, `Private key file (for tls). Eg: cert.key`)
 var creds = flag.String(`u`, ``, `HTTP proxy credentials (user:pass)`)
+var remoteTlsServer = flag.String(`r`, ``, `Remote tls server. Eg: 127.0.0.1:443`)
+var remoteCreds = flag.String(`ru`, ``, `Remote credentials (token)`)
+var sni = flag.String(`sni`, ``, `Remote tls server sni`)
 var proxyAuth []byte
+
+var zeroTime = time.Time{}
 
 func main() {
 	flag.Parse()
@@ -132,6 +139,30 @@ func main() {
 		proxyAuth = []byte(`Basic `)
 		proxyAuth = append(proxyAuth, []byte(base64.StdEncoding.EncodeToString([]byte(*creds)))...)
 		log.Println("Proxy-Authorization:", string(proxyAuth))
+	}
+
+	if *remoteTlsServer != "" {
+		newDial := (&tls.Dialer{
+			NetDialer: netDialer,
+			Config: &tls.Config{
+				InsecureSkipVerify: true,
+				ServerName:         *sni,
+			},
+		}).Dial
+		localDialFunc = func(network, address string) (c net.Conn, err error) {
+			c, err = newDial("tcp", *remoteTlsServer)
+			if err != nil {
+				return
+			}
+			c.SetWriteDeadline(time.Now().Add(dialTimeout))
+			var d []byte
+			d = append(d, *remoteCreds...)
+			d = append(d, address...)
+			d = append(d, '\n')
+			_, err = c.Write(d)
+			c.SetWriteDeadline(zeroTime)
+			return
+		}
 	}
 
 	// Server
@@ -149,6 +180,9 @@ func main() {
 	}
 	if err != nil {
 		log.Panicln(err)
+	}
+	if ln == nil {
+		log.Panicln(`Error listening:`, *listen)
 	}
 
 	srv := &fasthttp.Server{
